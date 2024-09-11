@@ -4,8 +4,10 @@ import os
 import time
 from collections import defaultdict, deque
 
+import numpy as np
 import torch
 import torch.distributed as dist
+from thop import profile
 
 from utils.logging import log
 
@@ -282,3 +284,65 @@ def init_distributed_mode(args):
     )
     torch.distributed.barrier()
     setup_for_distributed(args['rank'] == 0)
+
+
+def preds_or_target_to_tensor(data: list[dict]) -> list[dict]:
+    """Converts the boxes, scores, and labels in the data to torch tensors."""
+    for i in range(len(data)):
+        if "boxes" in data[i]:
+            data[i]["boxes"] = torch.as_tensor(data[i]["boxes"], dtype=torch.float32)
+        if "scores" in data[i]:
+            data[i]["scores"] = torch.as_tensor(data[i]["scores"], dtype=torch.float32)
+        if "labels" in data[i]:
+            data[i]["labels"] = torch.as_tensor(data[i]["labels"], dtype=torch.int64)
+
+    return data
+
+
+def smooth(y, f=0.05):
+    """Smooth data using a box filter of fraction f."""
+    was_tensor = False
+    if isinstance(y, torch.Tensor):
+        y = y.cpu().numpy()
+        was_tensor = True
+
+    # Box filter of fraction f
+    nf = round(len(y) * f * 2) // 2 + 1  # number of filter elements (must be odd)
+    p = np.ones(nf // 2)  # ones padding
+    yp = np.concatenate((p * y[0], y, p * y[-1]), 0)  # y padded
+    y_smoothed = np.convolve(yp, np.ones(nf) / nf, mode='valid')  # y-smoothed
+    if was_tensor:
+        y_smoothed = torch.from_numpy(y_smoothed)
+    
+    return y_smoothed
+
+
+def count_parameters(model: torch.nn.Module) -> int:
+    """Count the number of parameters in the `model`."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def estimate_gflops(model: torch.nn.Module, input_size=(1, 3, 640, 640)) -> float:
+    """Estimate the GFLOPs for the given `model` using the given `input_size`."""
+    input = torch.randn(input_size).to(next(model.parameters()).device)
+    flops, _ = profile(model, inputs=(input,))
+    return flops / 1e9  # Convert to GFLOPs
+
+
+def measure_inference_speed(model, input_size=(1, 3, 640, 640), num_iterations=100):
+    """Measure the inference speed of the `model` using the given `input_size` and `num_iterations`."""
+    input = torch.randn(input_size).to(next(model.parameters()).device)
+
+    # Warm-up
+    for _ in range(10):
+        _ = model(input)
+
+    # Measure
+    torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(num_iterations):
+        _ = model(input)
+    torch.cuda.synchronize()
+    end_time = time.time()
+
+    return (end_time - start_time) / num_iterations * 1000  # ms

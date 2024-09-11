@@ -9,8 +9,19 @@ import json
 from torch.utils.tensorboard.writer import SummaryWriter
 
 # Initialize Weights and Biases.
-def wandb_init(name):
-    wandb.init(name=name)
+def wandb_init(name, project=None, entity_name=None, config=None):
+    if project and entity_name:
+        wandb.init(
+            project=project,
+            name=name,
+            entity=entity_name,
+            config=config,
+        )
+    else:
+        wandb.init(name=name)
+
+def wandb_generate_id():
+    return wandb.util.generate_id()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -146,7 +157,15 @@ def wandb_log(
     val_map_05, 
     val_map,
     val_pred_image,
-    image_size
+    val_epoch_loss,
+    val_batch_avg_loss_cls,
+    val_batch_avg_loss_box_reg,
+    val_batch_avg_loss_objectness,
+    val_batch_avg_loss_rpn,
+    avg_precision,
+    avg_recall,
+    image_size,
+    epoch=None
 ):
     """
     :param epoch_loss: Single loss value for the current epoch.
@@ -156,36 +175,33 @@ def wandb_log(
     :param val_map: Current epochs validation mAP@0.5:0.95 IoU. 
     """
     # WandB logging.
-    for i in range(len(loss_list_batch)):
-        wandb.log(
-            {'train_loss_iter': loss_list_batch[i],},
-        )
+    # for i in range(len(loss_list_batch)):
+    #     wandb.log(
+    #         {'train_loss_iter': loss_list_batch[i],},
+    #     )
     # for i in range(len(loss_cls_list)):
-    wandb.log(
-        {
-            'train_loss_cls': loss_cls_list[-1],
-            'train_loss_box_reg': loss_box_reg_list[-1],
-            'train_loss_obj': loss_objectness_list[-1],
-            'train_loss_rpn': loss_rpn_list[-1]
-        }
-    )
-    wandb.log(
-        {
-            'train_loss_epoch': epoch_loss
-        },
-    )
-    wandb.log(
-        {'val_map_05_95': val_map}
-    )
-    wandb.log(
-        {'val_map_05': val_map_05}
-    )
+    log_dict = {
+        "train/loss": epoch_loss,
+        "train/cls_loss": loss_cls_list[-1],
+        "train/box_loss": loss_box_reg_list[-1],
+        "train/obj_loss": loss_objectness_list[-1],
+        "train/rpn_loss": loss_rpn_list[-1],
+        "val/loss": val_epoch_loss,  # Iteration loss (last value in the list)
+        "val/cls_loss": val_batch_avg_loss_cls,
+        "val/box_loss": val_batch_avg_loss_box_reg,
+        "val/obj_loss": val_batch_avg_loss_objectness,
+        "val/rpn_loss": val_batch_avg_loss_rpn,
+        "metrics/precision(B)": avg_precision,
+        "metrics/recall(B)": avg_recall,
+        "metrics/mAP50-95(B)": val_map,
+        "metrics/mAP50(B)": val_map_05,
+    }
 
     bg = np.full((image_size * 2, image_size * 2, 3), 114, dtype=np.float32)
 
     if len(val_pred_image) == 1:
         log_image = overlay_on_canvas(bg, val_pred_image[0])
-        wandb.log({'predictions': [wandb.Image(log_image)]})
+        log_dict['predictions'] = [wandb.Image(log_image)]
 
     if len(val_pred_image) == 2:
         log_image = cv2.hconcat(
@@ -194,7 +210,7 @@ def wandb_log(
                 overlay_on_canvas(bg, val_pred_image[1])
             ]
         )
-        wandb.log({'predictions': [wandb.Image(log_image)]})
+        log_dict['predictions'] = [wandb.Image(log_image)]
 
     if len(val_pred_image) > 2 and len(val_pred_image) <= 8:
         log_image = overlay_on_canvas(bg, val_pred_image[0])
@@ -203,8 +219,8 @@ def wandb_log(
                 log_image, 
                 overlay_on_canvas(bg, val_pred_image[i+1])
             ])
-        wandb.log({'predictions': [wandb.Image(log_image)]})
-    
+        log_dict['predictions'] = [wandb.Image(log_image)]
+
     if len(val_pred_image) > 8:
         log_image = overlay_on_canvas(bg, val_pred_image[0])
         for i in range(len(val_pred_image)-1):
@@ -214,7 +230,33 @@ def wandb_log(
                 log_image, 
                 overlay_on_canvas(bg, val_pred_image[i-1])
             ])
-        wandb.log({'predictions': [wandb.Image(log_image)]})
+        log_dict['predictions'] = [wandb.Image(log_image)]
+
+    wandb.log(log_dict, step=int(epoch) if epoch else None)
+
+def wandb_log_tables(tables: dict[str, list], columns: list[str]) -> None:
+    """
+    Log tables to Weights&Biases.
+
+    :param tables: Dictionary containing table names as keys and tables as values.
+    :param columns: List of column names, whose size must coincide with the number of columns in 
+                    each table.
+    """
+    log_dict = {}
+    for name, table in tables.items():
+        log_dict[name] = wandb.Table(columns=columns, data=table)
+
+    # Log tables to wandb
+    wandb.log(log_dict)
+
+def wandb_log_dict(log_dict: dict[str, float], step: int = None) -> None:
+    """
+    Log dictionary to Weights&Biases.
+
+    :param log_dict: Dictionary containing key-value pairs to log.
+    :param step: Step number.
+    """
+    wandb.log(log_dict, step=step)
 
 def wandb_save_model(model_dir):
     """
@@ -243,7 +285,7 @@ class LogJSON():
         self.annotation_id = max([ann['id'] for ann in self.annotations], default=0) + 1
         self.image_id = len(self.images) + 1
 
-    def update(self, image, file_name, boxes, labels, classes):
+    def update(self, image, file_name, output, classes):
         """
         Update the log file metrics with the current image or current frame information.
 
@@ -264,8 +306,8 @@ class LogJSON():
             "height": image_info['height']
         })
 
-        boxes = np.array(boxes, dtype=np.float64)
-        labels = np.array(labels, dtype=np.float64)
+        boxes = output['boxes'].tolist()
+        labels = output['labels'].tolist()
 
         for box, label in zip(boxes, labels):
             xmin, ymin, xmax, ymax = box
@@ -282,7 +324,7 @@ class LogJSON():
             }
             self.annotations.append(annotation)
             self.annotation_id += 1
-            self.categories.add(int(label))
+            self.categories.add(label)
 
         # Update categories
         self.coco_data['categories'] = [{"id": cat_id, "name": classes[cat_id]} for cat_id in self.categories]

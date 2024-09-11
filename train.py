@@ -14,41 +14,57 @@ python train.py --model fasterrcnn_resnet50_fpn --epochs 2 --use-train-aug --dat
 export CUDA_VISIBLE_DEVICES=0,1
 python -m torch.distributed.launch --nproc_per_node=2 --use_env train.py --data data_configs/smoke.yaml --epochs 100 --model fasterrcnn_resnet50_fpn --name smoke_training --batch 16
 """
-from torch_utils.engine import (
-    train_one_epoch, evaluate, utils
-)
-from torch.utils.data import (
-    distributed, RandomSampler, SequentialSampler
-)
+import argparse
+import os
+
+import numpy as np
+import torch
+import torchinfo
+import yaml
+from torch.utils.data import RandomSampler, SequentialSampler, distributed
+
 from datasets import (
-    create_train_dataset, create_valid_dataset, 
-    create_train_loader, create_valid_loader
+    create_train_dataset,
+    create_train_loader,
+    create_valid_dataset,
+    create_valid_loader,
 )
 from models.create_fasterrcnn_model import create_model
+from torch_utils.engine import (
+    evaluate,
+    get_final_precision_recall_f1_tables,
+    model_performance_analysis,
+    train_one_epoch,
+    utils,
+    validate_one_epoch,
+)
 from utils.general import (
-    set_training_dir, Averager, 
-    save_model, save_loss_plot,
+    Averager,
+    EarlyStopping,
+    SaveBestModel,
+    init_seeds,
+    save_loss_plot,
+    save_mAP,
+    save_model,
+    save_model_state,
+    set_training_dir,
     show_tranformed_image,
-    save_mAP, save_model_state, SaveBestModel,
-    yaml_save, init_seeds, EarlyStopping
+    yaml_save,
 )
 from utils.logging import (
-    set_log, coco_log,
-    set_summary_writer, 
-    tensorboard_loss_log, 
-    tensorboard_map_log,
+    coco_log,
     csv_log,
-    wandb_log, 
+    set_log,
+    set_summary_writer,
+    tensorboard_loss_log,
+    tensorboard_map_log,
+    wandb_generate_id,
+    wandb_init,
+    wandb_log,
+    wandb_log_dict,
+    wandb_log_tables,
     wandb_save_model,
-    wandb_init
 )
-
-import torch
-import argparse
-import yaml
-import numpy as np
-import torchinfo
-import os
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -210,6 +226,26 @@ def parse_opt():
               --project-dir will be named if not already present',
         type=str
     )
+    
+    # Added by me:
+    parser.add_argument(
+        '--trainable-backbone-layers',
+        default=None,
+        type=int,
+        help='number of trainable layers in the backbone'
+    )
+    parser.add_argument(
+        '--wandb-project',
+        default=None,
+        type=str,
+        help='WandB project name'
+    )
+    parser.add_argument(
+        '--wandb-entity',
+        default=None,
+        type=str,
+        help='WandB entity name'
+    )
 
     args = vars(parser.parse_args())
     return args
@@ -220,13 +256,18 @@ def main(args):
 
     # Initialize W&B with project name.
     if not args['disable_wandb']:
-        wandb_init(name=args['name'])
+        wandb_init(
+            name=args["name"] + "-" + wandb_generate_id(),
+            project=args["wandb_project"],
+            entity_name=args["wandb_entity"],
+        )
+
     # Load the data configurations
     with open(args['data']) as file:
         data_configs = yaml.safe_load(file)
 
     init_seeds(args['seed'] + 1 + RANK, deterministic=True)
-    
+
     # Settings/parameters/constants.
     TRAIN_DIR_IMAGES = os.path.normpath(data_configs['TRAIN_DIR_IMAGES'])
     TRAIN_DIR_LABELS = os.path.normpath(data_configs['TRAIN_DIR_LABELS'])
@@ -252,7 +293,7 @@ def main(args):
 
     # Model configurations
     IMAGE_SIZE = args['imgsz']
-    
+
     train_dataset = create_train_dataset(
         TRAIN_DIR_IMAGES, 
         TRAIN_DIR_LABELS,
@@ -307,15 +348,28 @@ def main(args):
     val_map = []
     start_epochs = 0
 
+    val_loss_hist = Averager()
+    val_loss_list_epoch = []
+
     if args['weights'] is None:
-        print('Building model from models folder...')
+        print('Building model from scratch...')
         build_model = create_model[args['model']]
-        model = build_model(num_classes=NUM_CLASSES, pretrained=True)
+
+        # Added by me:
+        if args['trainable_backbone_layers'] is not None:
+            print(f'Using {args["trainable_backbone_layers"]} trainable backbone layers...')
+            model = build_model(
+                num_classes=NUM_CLASSES, 
+                pretrained=True,
+                trainable_backbone_layers=args['trainable_backbone_layers']
+            )
+        else:
+            model = build_model(num_classes=NUM_CLASSES, pretrained=True)
 
     # Load pretrained weights if path is provided.
     if args['weights'] is not None:
         print('Loading pretrained weights...')
-        
+
         # Load the pretrained checkpoint.
         checkpoint = torch.load(args['weights'], map_location=DEVICE) 
         keys = list(checkpoint['model_state_dict'].keys())
@@ -325,7 +379,17 @@ def main(args):
 
         # Build the new model with number of classes same as checkpoint.
         build_model = create_model[args['model']]
-        model = build_model(num_classes=old_classes)
+
+        # Added by me:
+        if args['trainable_backbone_layers'] is not None:
+            print(f'Using {args["trainable_backbone_layers"]} trainable backbone layers...')
+            model = build_model(
+                num_classes=old_classes, 
+                trainable_backbone_layers=args['trainable_backbone_layers']
+            )
+        else:
+            model = build_model(num_classes=old_classes)
+
         # Load weights.
         model.load_state_dict(ckpt_state_dict)
 
@@ -341,7 +405,7 @@ def main(args):
 
         if args['resume_training']:
             print('RESUMING TRAINING...')
-            # Update the starting epochs, the batch-wise loss list, 
+            # Update the starting epochs, the batch-wise loss list,
             # and the epoch-wise loss list.
             if checkpoint['epoch']:
                 start_epochs = checkpoint['epoch']
@@ -358,7 +422,7 @@ def main(args):
             if checkpoint['val_map_05']:
                 val_map_05 = checkpoint['val_map_05']
 
-    # Make the model transform's `min_size` same as `imgsz` argument. 
+    # Make the model transform's `min_size` same as `imgsz` argument.
     model.transform.min_size = (args['imgsz'], )
     model = model.to(DEVICE)
     if args['sync_bn'] and args['distributed']:
@@ -412,20 +476,41 @@ def main(args):
     for epoch in range(start_epochs, NUM_EPOCHS):
         train_loss_hist.reset()
 
-        _, batch_loss_list, \
-            batch_loss_cls_list, \
-            batch_loss_box_reg_list, \
-            batch_loss_objectness_list, \
-            batch_loss_rpn_list = train_one_epoch(
-            model, 
-            optimizer, 
-            train_loader, 
-            DEVICE, 
-            epoch, 
+        (
+            _,
+            batch_loss_list,
+            batch_loss_cls_list,
+            batch_loss_box_reg_list,
+            batch_loss_objectness_list,
+            batch_loss_rpn_list,
+        ) = train_one_epoch(
+            model,
+            optimizer,
+            train_loader,
+            DEVICE,
+            epoch,
             train_loss_hist,
             print_freq=100,
             scheduler=scheduler,
-            scaler=SCALER
+            scaler=SCALER,
+        )
+
+        (
+            _,
+            _,
+            val_batch_avg_loss_cls,
+            val_batch_avg_loss_box_reg,
+            val_batch_avg_loss_objectness,
+            val_batch_avg_loss_rpn,
+            val_batch_avg_precision,
+            val_batch_avg_recall
+        ) = validate_one_epoch(
+            model,
+            valid_loader,
+            DEVICE,
+            epoch,
+            val_loss_hist,
+            print_freq=100,
         )
 
         stats, val_pred_image = evaluate(
@@ -440,17 +525,18 @@ def main(args):
 
         # Append the current epoch's batch-wise losses to the `train_loss_list`.
         train_loss_list.extend(batch_loss_list)
-        loss_cls_list.append(np.mean(np.array(batch_loss_cls_list,)))
-        loss_box_reg_list.append(np.mean(np.array(batch_loss_box_reg_list)))
-        loss_objectness_list.append(np.mean(np.array(batch_loss_objectness_list)))
-        loss_rpn_list.append(np.mean(np.array(batch_loss_rpn_list)))
+        loss_cls_list.append(np.sum(np.array(batch_loss_cls_list,)))
+        loss_box_reg_list.append(np.sum(np.array(batch_loss_box_reg_list)))
+        loss_objectness_list.append(np.sum(np.array(batch_loss_objectness_list)))
+        loss_rpn_list.append(np.sum(np.array(batch_loss_rpn_list)))
 
         # Append curent epoch's average loss to `train_loss_list_epoch`.
         train_loss_list_epoch.append(train_loss_hist.value)
+        val_loss_list_epoch.append(val_loss_hist.value)
         val_map_05.append(stats[1])
         val_map.append(stats[0])
 
-        # Save loss plot for batch-wise list.
+        # Save train/loss plot for batch-wise list.
         save_loss_plot(OUT_DIR, train_loss_list)
         # Save loss plot for epoch-wise list.
         save_loss_plot(
@@ -459,6 +545,14 @@ def main(args):
             'epochs',
             'train loss',
             save_name='train_loss_epoch' 
+        )
+        # Save val/loss plot for epoch-wise list.
+        save_loss_plot(
+            OUT_DIR, 
+            val_loss_list_epoch,
+            'epochs',
+            'val loss',
+            save_name='val_loss_epoch' 
         )
         # Save all the training loss plots.
         save_loss_plot(
@@ -538,14 +632,22 @@ def main(args):
                 stats[1],
                 stats[0],
                 val_pred_image,
-                IMAGE_SIZE
+                val_loss_hist.value,
+                val_batch_avg_loss_cls,
+                val_batch_avg_loss_box_reg,
+                val_batch_avg_loss_objectness,
+                val_batch_avg_loss_rpn,
+                val_batch_avg_precision,
+                val_batch_avg_recall,
+                IMAGE_SIZE,
+                epoch=epoch + 1
             )
 
-        # Save the current epoch model state. This can be used 
+        # Save the current epoch model state. This can be used
         # to resume training. It saves model state dict, number of
         # epochs trained for, optimizer state dict, and loss function.
         save_model(
-            epoch, 
+            epoch,
             model, 
             optimizer, 
             train_loss_list, 
@@ -556,8 +658,10 @@ def main(args):
             data_configs,
             args['model']
         )
+
         # Save the model dictionary only for the current epoch.
         save_model_state(model, OUT_DIR, data_configs, args['model'])
+
         # Save best model if the current mAP @0.5:0.95 IoU is
         # greater than the last hightest.
         save_best_model(
@@ -569,17 +673,56 @@ def main(args):
             args['model']
         )
 
-            # Early stopping check.
+        # Early stopping check
         early_stopping(stats[0])
         if early_stopping.early_stop:
             break
-    
+
     # Save models to Weights&Biases.
     if not args['disable_wandb']:
         wandb_save_model(OUT_DIR)
 
+    tables = get_final_precision_recall_f1_tables(model, valid_loader, DEVICE, print_freq=100)
+    model_performance = model_performance_analysis(model)
+
+    # WandB logging of the final tables
+    if not args['disable_wandb']:
+        wandb_log_tables(tables, columns=["class", "y", "x"])
+        wandb_log_dict(model_performance)
+
 
 if __name__ == '__main__':
-    args = parse_opt()
-    main(args)
+    # For debugging:
+    # args = {
+    #     "model": "fasterrcnn_resnet50_fpn",
+    #     "data": "data_configs/guitar-necks-detector.yaml",
+    #     "device": "cuda",
+    #     "epochs": 20,
+    #     "workers": 4,
+    #     "batch": 8,
+    #     "lr": 0.001,
+    #     "imgsz": 640,
+    #     "name": "fasterrcnn_restnet50_fpn_finetuned",
+    #     "vis_transformed": False,
+    #     "mosaic": 0.0,
+    #     "use_train_aug": False,
+    #     "cosine_annealing": False,
+    #     "weights": None,
+    #     "resume_training": False,
+    #     "square_training": False,
+    #     "world_size": 1,
+    #     "dist_url": "env://",
+    #     "disable_wandb": True,
+    #     "sync_bn": False,
+    #     "amp": False,
+    #     "patience": 10,
+    #     "seed": 0,
+    #     "project_dir": None,
+    #     "trainable_backbone_layers": 1,
+    #     "wandb_project": None,
+    #     "wandb_entity": None,
+    # }
 
+    args = parse_opt()
+    print("Using arguments: ", args)
+    main(args)

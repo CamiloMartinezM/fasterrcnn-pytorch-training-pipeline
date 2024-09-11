@@ -1,26 +1,26 @@
 from models import *
 
 def return_fasterrcnn_resnet50_fpn(
-    num_classes, pretrained=True, coco_model=False
+    num_classes, pretrained=True, coco_model=False, trainable_backbone_layers=3
 ):
     model = fasterrcnn_resnet50_fpn.create_model(
-        num_classes, pretrained=pretrained, coco_model=coco_model
+        num_classes, pretrained=pretrained, coco_model=coco_model, trainable_backbone_layers=trainable_backbone_layers
     )
     return model
 
 def return_fasterrcnn_mobilenetv3_large_fpn(
-    num_classes, pretrained=True, coco_model=False
+    num_classes, pretrained=True, coco_model=False, trainable_backbone_layers=3
 ):
     model = fasterrcnn_mobilenetv3_large_fpn.create_model(
-        num_classes, pretrained=pretrained, coco_model=coco_model
+        num_classes, pretrained=pretrained, coco_model=coco_model, trainable_backbone_layers=trainable_backbone_layers
     )
     return model
 
 def return_fasterrcnn_mobilenetv3_large_320_fpn(
-    num_classes, pretrained=True, coco_model=False
+    num_classes, pretrained=True, coco_model=False, trainable_backbone_layers=3
 ):    
     model = fasterrcnn_mobilenetv3_large_320_fpn.create_model(
-        num_classes, pretrained=pretrained, coco_model=coco_model
+        num_classes, pretrained=pretrained, coco_model=coco_model, trainable_backbone_layers=trainable_backbone_layers
     )
     return model
 
@@ -137,10 +137,10 @@ def return_fasterrcnn_resnet152(
     return model
 
 def return_fasterrcnn_resnet50_fpn_v2(
-    num_classes, pretrained=True, coco_model=False
+    num_classes, pretrained=True, coco_model=False, trainable_backbone_layers=3
 ):
     model = fasterrcnn_resnet50_fpn_v2.create_model(
-        num_classes, pretrained=pretrained, coco_model=coco_model
+        num_classes, pretrained=pretrained, coco_model=coco_model, trainable_backbone_layers=trainable_backbone_layers
     )
     return model
 
